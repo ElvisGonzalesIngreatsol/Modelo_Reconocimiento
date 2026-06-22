@@ -98,7 +98,7 @@ class MainActivity : AppCompatActivity() {
                 setNumThreads(4)
             }
             tfLiteInterpreter = Interpreter(modelBuffer, options)
-            Log.d("TensorFlow", "¡Modelo YOLOv8 cargado exitosamente mediante Interpreter!")
+            Log.d("TensorFlow", "¡Modelo YOLOv11 cargado exitosamente mediante Interpreter!")
 
         } catch (e: Exception) {
             Log.e("TensorFlow", "Error al cargar el modelo .tflite", e)
@@ -134,6 +134,7 @@ class MainActivity : AppCompatActivity() {
             val imageAnalyzer = ImageAnalysis.Builder()
                 .setTargetRotation(rotation)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888) // Forzamos RGBA para manipulación directa de píxeles
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
@@ -155,70 +156,66 @@ class MainActivity : AppCompatActivity() {
     private fun procesarImagenConIA(imageProxy: ImageProxy) {
         val interpreter = tfLiteInterpreter
         if (interpreter != null) {
-            val bitmap = imageProxy.toBitmap()
+            // Convertimos el ImageProxy a Bitmap nativo compatible
+            val bitmap = imageProxyToBitmap(imageProxy)
 
             if (bitmap != null) {
-                val matrix = Matrix().apply { postRotate(imageProxy.imageInfo.rotationDegrees.toFloat()) }
-                val rotatedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-                val resizedBitmap = Bitmap.createScaledBitmap(rotatedBitmap, 640, 640, true)
-
+                // Redimensionamos al tamaño de entrada que espera el modelo (640x640)
+                val resizedBitmap = Bitmap.createScaledBitmap(bitmap, 640, 640, true)
                 val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
 
-                // Formato de salida estándar de YOLOv8: 1 lote, 300 detecciones máximas, 6 atributos por caja
-                val outputMap = Array(1) { Array(300) { FloatArray(6) } }
+                // CONTENEDOR CORRECTO PARA LA SALIDA DE YOLOV11 SIN NMS: [1][6][8400]
+                // Índices: 0,1,2,3 -> Cajas | 4 -> Confianza Clase 'cinta' | 5 -> Confianza Clase 'mano'
+                val outputMap = Array(1) { Array(6) { FloatArray(8400) } }
 
                 try {
                     interpreter.run(inputBuffer, outputMap)
 
                     // Lista temporal donde guardaremos las coordenadas de las manos vistas en ESTE cuadro físico
                     val cajasManosCuadroActual = mutableListOf<RectF>()
-                    var cintaEncontradaEnEsteFrame = false
+                    var mejorCintaDetectada: RectF? = null
+                    var maxConfianzaCinta = 0.50f // Umbral del 50% para la cinta
+                    val confUmbralMano = 0.50f    // Umbral del 50% para las manos
 
-                    // Analizamos las 300 cajas de predicción del array del modelo
-                    for (i in 0 until 300) {
-                        val score = outputMap[0][i][4]
-                        val classId = outputMap[0][i][5].toInt()
+                    // Recorremos las 8400 predicciones brutas de la arquitectura YOLOv11
+                    for (i in 0 until 8400) {
+                        val confCinta = outputMap[0][4][i]
+                        val confMano = outputMap[0][5][i]
 
-                        // Umbral de confianza del 50% para dar por válida una detección
-                        if (score > 0.5f) {
-                            when (classId) {
-                                0 -> {
-                                    // Clase 0: Corresponde a las MANOS detectadas.
-                                    // Extraemos las coordenadas de la caja (X e Y relativas entre 0.0 y 640.0)
-                                    val left = outputMap[0][i][0]
-                                    val top = outputMap[0][i][1]
-                                    val right = outputMap[0][i][2]
-                                    val bottom = outputMap[0][i][3]
+                        // Si la probabilidad más alta pertenece a una MANO
+                        if (confMano > confUmbralMano && confMano > confCinta) {
+                            val cx = outputMap[0][0][i] * bitmap.width / 640f
+                            val cy = outputMap[0][1][i] * bitmap.height / 640f
+                            val w = outputMap[0][2][i] * bitmap.width / 640f
+                            val h = outputMap[0][3][i] * bitmap.height / 640f
 
-                                    cajasManosCuadroActual.add(RectF(left, top, right, bottom))
-                                }
-                                1 -> {
-                                    ultimoColorDetectado = "Rojo"
-                                    cintaEncontradaEnEsteFrame = true
-                                }
-                                2 -> {
-                                    ultimoColorDetectado = "Café"
-                                    cintaEncontradaEnEsteFrame = true
-                                }
-                                3 -> {
-                                    ultimoColorDetectado = "Negra"
-                                    cintaEncontradaEnEsteFrame = true
-                                }
-                            }
+                            val rect = RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
+                            cajasManosCuadroActual.add(rect)
+                        }
+                        // Si la probabilidad más alta pertenece a una CINTA
+                        else if (confCinta > maxConfianzaCinta && confCinta > confMano) {
+                            maxConfianzaCinta = confCinta
+                            val cx = outputMap[0][0][i] * bitmap.width / 640f
+                            val cy = outputMap[0][1][i] * bitmap.height / 640f
+                            val w = outputMap[0][2][i] * bitmap.width / 640f
+                            val h = outputMap[0][3][i] * bitmap.height / 640f
+
+                            mejorCintaDetectada = RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
                         }
                     }
 
-                    // Enviamos las cajas de las manos detectadas en este cuadro al Tracker
+                    // Enviamos las cajas de las manos detectadas en este cuadro al Tracker por IoU
                     bananaTracker.updateTracks(cajasManosCuadroActual)
+
+                    // Si el modelo localizó una cinta válida, extraemos dinámicamente su color real en HSV
+                    if (mejorCintaDetectada != null) {
+                        ultimoColorDetectado = obtenerColorDeCinta(bitmap, mejorCintaDetectada)
+                    } else if (bananaTracker.totalUniqueHandsCount == 0) {
+                        ultimoColorDetectado = "Sin Cinta"
+                    }
 
                     // Si hay IDs registrados en memoria, asumimos que hay mínimo un racimo enfocado
                     val racimoEnVista = if (bananaTracker.totalUniqueHandsCount > 0) 1 else 0
-
-                    // Si en este frame ninguna cinta superó el 50%, no alteramos el 'ultimoColorDetectado'
-                    // para mitigar parpadeos bruscos, a menos que el tracker esté completamente vacío.
-                    if (!cintaEncontradaEnEsteFrame && bananaTracker.totalUniqueHandsCount == 0) {
-                        ultimoColorDetectado = "Sin Cinta"
-                    }
 
                     // Envío ordenado de resultados limpios al hilo principal de la interfaz
                     runOnUiThread {
@@ -232,6 +229,77 @@ class MainActivity : AppCompatActivity() {
             }
         }
         imageProxy.close()
+    }
+
+    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
+        val planes = imageProxy.planes
+        val buffer = planes[0].buffer
+        val pixelStride = planes[0].pixelStride
+        val rowStride = planes[0].rowStride
+        val rowPadding = rowStride - pixelStride * imageProxy.width
+
+        val bitmap = Bitmap.createBitmap(
+            imageProxy.width + rowPadding / pixelStride,
+            imageProxy.height,
+            Bitmap.Config.ARGB_8888
+        )
+        bitmap.copyPixelsFromBuffer(buffer)
+
+        // Corregimos la rotación física del sensor del teléfono para procesar derecho el racimo
+        if (imageProxy.imageInfo.rotationDegrees != 0) {
+            val matrix = Matrix()
+            matrix.postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+            return Bitmap.createBitmap(bitmap, 0, 0, imageProxy.width, imageProxy.height, matrix, true)
+        }
+        return bitmap
+    }
+
+    private fun obtenerColorDeCinta(bitmapOriginal: Bitmap, rectCinta: RectF): String {
+        // Asegurar que el cuadro recortado no se salga de los límites reales de la foto capturada
+        val left = maxOf(0, rectCinta.left.toInt())
+        val top = maxOf(0, rectCinta.top.toInt())
+        val width = minOf(bitmapOriginal.width - left, rectCinta.width().toInt())
+        val height = minOf(bitmapOriginal.height - top, rectCinta.height().toInt())
+
+        if (width <= 0 || height <= 0) return "Detectando..."
+
+        // Recortamos la sub-imagen exacta donde la IA dice que está la cinta de edad
+        val cropCinta = Bitmap.createBitmap(bitmapOriginal, left, top, width, height)
+
+        var sumHue = 0f
+        var sumSat = 0f
+        var sumVal = 0f
+        val totalPixeles = cropCinta.width * cropCinta.height
+        val hsv = FloatArray(3)
+
+        // Recorremos los píxeles para promediar el color real tapando sombras del cobertizo
+        for (x in 0 until cropCinta.width) {
+            for (y in 0 until cropCinta.height) {
+                val pixel = cropCinta.getPixel(x, y)
+                android.graphics.Color.colorToHSV(pixel, hsv)
+                sumHue += hsv[0]
+                sumSat += hsv[1]
+                sumVal += hsv[2]
+            }
+        }
+
+        val avgHue = sumHue / totalPixeles
+        val avgSat = sumSat / totalPixeles
+        val avgVal = sumVal / totalPixeles
+
+        // Si está muy oscuro o muy opaco debido al entorno, se marca como sombra
+        if (avgVal < 0.2f || avgSat < 0.15f) return "Buscando... (Sombra)"
+
+        // Clasificación matemática según los grados del espectro HUE (0° a 360°)
+        return when (avgHue) {
+            in 0.0..20.0 -> "Rojo (Semana 1)"
+            in 20.0..50.0 -> "Naranja (Semana 2)"
+            in 50.0..85.0 -> "Amarillo / Verde Claro (Semana 3)"
+            in 85.0..160.0 -> "Verde (Semana 4)"
+            in 160.0..240.0 -> "Azul / Morado (Semana 5)"
+            in 240.0..330.0 -> "Morado / Violeta (Semana 6)"
+            else -> "Sin Cinta"
+        }
     }
 
     private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
