@@ -4,14 +4,18 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Matrix
 import android.graphics.RectF
 import android.net.Uri
 import android.os.Bundle
+import android.provider.MediaStore
 import android.provider.Settings
 import android.util.Log
+import android.graphics.Color
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
@@ -25,6 +29,7 @@ import androidx.core.content.ContextCompat
 import com.google.android.material.floatingactionbutton.FloatingActionButton
 import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
+import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
@@ -34,52 +39,68 @@ import java.util.concurrent.Executors
 class MainActivity : AppCompatActivity() {
 
     private lateinit var viewFinder: PreviewView
+    private lateinit var overlayView: OverlayView
     private lateinit var tvTotalRacimos: TextView
     private lateinit var tvTotalManos: TextView
     private lateinit var tvColorCinta: TextView
     private lateinit var btnResetTracker: FloatingActionButton
+    private lateinit var btnUploadImage: FloatingActionButton
 
     private lateinit var cameraExecutor: ExecutorService
     private var tfLiteInterpreter: Interpreter? = null
-
-    // Instanciamos el tracker inteligente encargado de recordar los IDs únicos al girar el racimo
     private val bananaTracker = BananaTracker()
-
-    // Variable global que recuerda el último estado de color para evitar el parpadeo en la interfaz
     private var ultimoColorDetectado = "Sin Cinta"
+
+    // Selector interactivo para abrir la galería del teléfono
+    private val selectImageLauncher = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (result.resultCode == RESULT_OK && result.data != null) {
+            val imageUri: Uri? = result.data?.data
+            if (imageUri != null) {
+                try {
+                    val imageStream: InputStream? = contentResolver.openInputStream(imageUri)
+                    val selectedBitmap = BitmapFactory.decodeStream(imageStream)
+                    if (selectedBitmap != null) {
+                        Toast.makeText(this, "Procesando imagen seleccionada...", Toast.LENGTH_SHORT).show()
+                        procesarImagenEstatica(selectedBitmap)
+                    }
+                } catch (e: Exception) {
+                    Log.e("Gallery", "Error al cargar imagen", e)
+                }
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
         viewFinder = findViewById(R.id.viewFinder)
+        overlayView = findViewById(R.id.overlayView)
         tvTotalRacimos = findViewById(R.id.tvTotalRacimos)
         tvTotalManos = findViewById(R.id.tvTotalManos)
         tvColorCinta = findViewById(R.id.tvColorCinta)
         btnResetTracker = findViewById(R.id.btnResetTracker)
+        btnUploadImage = findViewById(R.id.btnUploadImage)
 
-        // Inicializamos los valores por defecto exactos que necesitas ver al arrancar
-        tvTotalRacimos.text = "Total de Racimos Enfocados: 0"
-        tvTotalManos.text = "Número de Manos Contadas: 0"
-        tvColorCinta.text = "Color de la Cinta: $ultimoColorDetectado"
-
-        // CONFIGURACIÓN DEL CLIC DEL BOTÓN DE REINICIO (Para pasar a un racimo nuevo)
         btnResetTracker.setOnClickListener {
-            bananaTracker.resetTracker()
-            ultimoColorDetectado = "Sin Cinta"
+            bananaTracker.reset()
 
+            ultimoColorDetectado = "Sin Cinta"
+            overlayView.setResults(emptyList())
             tvTotalRacimos.text = "Total de Racimos Enfocados: 0"
             tvTotalManos.text = "Número de Manos Contadas: 0"
-            tvColorCinta.text = "Color de la Cinta: $ultimoColorDetectado"
+            tvColorCinta.text = "Color de la Cinta: Sin Cinta"
+            Toast.makeText(this, "Contador reiniciado.", Toast.LENGTH_SHORT).show()
+        }
 
-            Toast.makeText(this, "Contador reiniciado. Listo para el nuevo racimo.", Toast.LENGTH_SHORT).show()
+        btnUploadImage.setOnClickListener {
+            val intent = Intent(Intent.ACTION_PICK, MediaStore.Images.Media.EXTERNAL_CONTENT_URI)
+            selectImageLauncher.launch(intent)
         }
 
         cameraExecutor = Executors.newSingleThreadExecutor()
-
         initObjectDetector()
 
-        // Esperamos que la vista se asiente en pantalla para validar permisos de cámara de manera segura
         viewFinder.post {
             checkCameraPermission()
         }
@@ -93,30 +114,380 @@ class MainActivity : AppCompatActivity() {
             val startOffset = assetFileDescriptor.startOffset
             val declaredLength = assetFileDescriptor.declaredLength
             val modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-
-            val options = Interpreter.Options().apply {
-                setNumThreads(4)
-            }
+            val options = Interpreter.Options().apply { setNumThreads(4) }
             tfLiteInterpreter = Interpreter(modelBuffer, options)
-            Log.d("TensorFlow", "¡Modelo YOLOv11 cargado exitosamente mediante Interpreter!")
-
         } catch (e: Exception) {
-            Log.e("TensorFlow", "Error al cargar el modelo .tflite", e)
-            runOnUiThread {
-                Toast.makeText(this, "Error al cargar el modelo de IA. Revisa el archivo en assets.", Toast.LENGTH_LONG).show()
+            Log.e("TensorFlow", "Error cargando modelo", e)
+        }
+    }
+
+    // ANALIZADOR DE VIDEO EN VIVO (CÁMARA)
+    @androidx.camera.core.ExperimentalGetImage
+    private fun procesarImagenConIA(imageProxy: ImageProxy) {
+        val interpreter = tfLiteInterpreter
+        if (interpreter != null) {
+            val bitmap = imageProxyToBitmap(imageProxy)
+            if (bitmap != null) {
+                val resizedBitmap = Bitmap.createScaledBitmap(bitmap, 640, 640, true)
+                val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
+                val outputMap = Array(1) { Array(6) { FloatArray(8400) } }
+
+                try {
+                    interpreter.run(inputBuffer, outputMap)
+
+                    val candidatasManos = mutableListOf<Pair<RectF, Float>>()
+                    var mejorCintaDetectada: RectF? = null
+                    var maxConfianzaCinta = 0.50f
+                    val confUmbralMano = 0.55f // Umbral alto para evitar falsos positivos en vivo
+
+                    // 1. Filtrado crudo inicial
+                    for (i in 0 until 8400) {
+                        val confCinta = outputMap[0][4][i]
+                        val confMano = outputMap[0][5][i]
+
+                        if (confMano > confUmbralMano && confMano > confCinta) {
+                            val cx = outputMap[0][0][i]
+                            val cy = outputMap[0][1][i]
+                            val w = outputMap[0][2][i]
+                            val h = outputMap[0][3][i]
+                            candidatasManos.add(Pair(RectF(cx - w/2, cy - h/2, cx + w/2, cy + h/2), confMano))
+                        } else if (confCinta > maxConfianzaCinta && confCinta > confMano) {
+                            maxConfianzaCinta = confCinta
+                            val cx = outputMap[0][0][i]
+                            val cy = outputMap[0][1][i]
+                            val w = outputMap[0][2][i]
+                            val h = outputMap[0][3][i]
+                            mejorCintaDetectada = RectF(cx - w/2, cy - h/2, cx + w/2, cy + h/2)
+                        }
+                    }
+
+                    // 2. NMS ULTRA ESTRICTO EN VIVO (Elimina los cuadros duplicados en la misma mano)
+                    val ordenadas = candidatasManos.sortedByDescending { it.second }.toMutableList()
+                    val manosFiltradas = mutableListOf<RectF>()
+
+                    while (ordenadas.isNotEmpty()) {
+                        val primera = ordenadas.removeAt(0)
+                        manosFiltradas.add(primera.first)
+
+                        val iterator = ordenadas.iterator()
+                        while (iterator.hasNext()) {
+                            val siguiente = iterator.next()
+                            // Si se superponen más del 30%, es la misma mano. Se elimina.
+                            if (calculateIoU(primera.first, siguiente.first) > 0.30f) {
+                                iterator.remove()
+                            }
+                        }
+                    }
+
+                    // 3. Preparar dibujo y tracking
+                    val cajasParaDibujarOverlay = mutableListOf<BoxDibujo>()
+                    val scaleX = viewFinder.width.toFloat() / 640f
+                    val scaleY = viewFinder.height.toFloat() / 640f
+
+                    for (rectMano in manosFiltradas) {
+                        val screenRect = RectF(rectMano.left * scaleX, rectMano.top * scaleY, rectMano.right * scaleX, rectMano.bottom * scaleY)
+                        cajasParaDibujarOverlay.add(BoxDibujo(screenRect, "Mano", true))
+                    }
+
+                    // Pasamos las cajas limpias al tracker (sin duplicados)
+                    bananaTracker.updateTracks(manosFiltradas, 640f)
+
+                    if (mejorCintaDetectada != null) {
+                        ultimoColorDetectado = obtenerColorDeCinta(bitmap, mejorCintaDetectada)
+                        val screenRectCinta = RectF(mejorCintaDetectada.left * scaleX, mejorCintaDetectada.top * scaleY, mejorCintaDetectada.right * scaleX, mejorCintaDetectada.bottom * scaleY)
+                        cajasParaDibujarOverlay.add(BoxDibujo(screenRectCinta, "Cinta: $ultimoColorDetectado", false))
+                    }
+
+                    val racimoEnVista = if (manosFiltradas.isNotEmpty()) 1 else 0
+
+                    runOnUiThread {
+                        overlayView.setResults(cajasParaDibujarOverlay)
+                        tvTotalRacimos.text = "Total de Racimos Enfocados: $racimoEnVista"
+
+                        // Muestra cuántas manos hay en este instante frente a la cámara y cuántas van acumuladas en total
+                        tvTotalManos.text = "Manos en vista: ${manosFiltradas.size} | Total Contadas: ${bananaTracker.totalUniqueHandsCount}"
+                        tvColorCinta.text = "Color de la Cinta: $ultimoColorDetectado"
+                    }
+                } catch (e: Exception) {
+                    Log.e("TensorFlow", "Error en inferencia de video", e)
+                }
             }
         }
+        imageProxy.close()
+    }
+
+    private fun procesarImagenEstatica(bitmapOriginal: Bitmap) {
+        val interpreter = tfLiteInterpreter ?: return
+
+        val resizedBitmap = Bitmap.createScaledBitmap(bitmapOriginal, 640, 640, true)
+        val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
+        val outputMap = Array(1) { Array(6) { FloatArray(8400) } }
+
+        try {
+            interpreter.run(inputBuffer, outputMap)
+
+            val candidatasManos = mutableListOf<Pair<RectF, Float>>()
+            var mejorCintaDetectada: RectF? = null
+            var maxConfianzaCinta = 0.50f
+            val confUmbralMano = 0.55f
+
+            for (i in 0 until 8400) {
+                val confCinta = outputMap[0][4][i]
+                val confMano = outputMap[0][5][i]
+
+                if (confMano > confUmbralMano && confMano > confCinta) {
+                    val cx = outputMap[0][0][i]
+                    val cy = outputMap[0][1][i]
+                    val w = outputMap[0][2][i]
+                    val h = outputMap[0][3][i]
+                    candidatasManos.add(Pair(RectF(cx - w/2, cy - h/2, cx + w/2, cy + h/2), confMano))
+                } else if (confCinta > maxConfianzaCinta && confCinta > confMano) {
+                    maxConfianzaCinta = confCinta
+                    val cx = outputMap[0][0][i]
+                    val cy = outputMap[0][1][i]
+                    val w = outputMap[0][2][i]
+                    val h = outputMap[0][3][i]
+                    mejorCintaDetectada = RectF(cx - w/2, cy - h/2, cx + w/2, cy + h/2)
+                }
+            }
+
+            // Ejecutar NMS estricto para la foto de galería
+            val ordenadas = candidatasManos.sortedByDescending { it.second }.toMutableList()
+            val manosFiltradas = mutableListOf<RectF>()
+
+            while (ordenadas.isNotEmpty()) {
+                val primera = ordenadas.removeAt(0)
+                manosFiltradas.add(primera.first)
+
+                val iterator = ordenadas.iterator()
+                while (iterator.hasNext()) {
+                    val siguiente = iterator.next()
+                    if (calculateIoU(primera.first, siguiente.first) > 0.25f) {
+                        iterator.remove()
+                    }
+                }
+            }
+
+            val conteoManosFoto = manosFiltradas.size
+            var colorCintaFoto = "Sin Cinta"
+
+            // CREAR UNA COPIA MUTABLE DEL BITMAP ORIGINAL PARA PINTAR
+            val bitmapResultadoConCuadros = bitmapOriginal.copy(Bitmap.Config.ARGB_8888, true)
+            val canvas = android.graphics.Canvas(bitmapResultadoConCuadros)
+
+            val paintManoModal = android.graphics.Paint().apply {
+                color = android.graphics.Color.parseColor("#9C27B0") // Morado para manos
+                style = android.graphics.Paint.Style.STROKE
+                strokeWidth = bitmapResultadoConCuadros.width * 0.007f
+            }
+            val paintCintaModal = android.graphics.Paint().apply {
+                color = android.graphics.Color.parseColor("#4CAF50") // Verde para la cinta
+                style = android.graphics.Paint.Style.STROKE
+                strokeWidth = bitmapResultadoConCuadros.width * 0.009f
+            }
+
+            // Dibujar las manos mapeadas a la escala original de la foto
+            for (rectMano in manosFiltradas) {
+                val realRect = RectF(
+                    rectMano.left * bitmapResultadoConCuadros.width / 640f,
+                    rectMano.top * bitmapResultadoConCuadros.height / 640f,
+                    rectMano.right * bitmapResultadoConCuadros.width / 640f,
+                    rectMano.bottom * bitmapResultadoConCuadros.height / 640f
+                )
+                canvas.drawRect(realRect, paintManoModal)
+            }
+
+            // Dibujar la cinta si existe
+            if (mejorCintaDetectada != null) {
+                colorCintaFoto = obtenerColorDeCinta(bitmapOriginal, mejorCintaDetectada)
+                val realRectCinta = RectF(
+                    mejorCintaDetectada.left * bitmapResultadoConCuadros.width / 640f,
+                    mejorCintaDetectada.top * bitmapResultadoConCuadros.height / 640f,
+                    mejorCintaDetectada.right * bitmapResultadoConCuadros.width / 640f,
+                    mejorCintaDetectada.bottom * bitmapResultadoConCuadros.height / 640f
+                )
+                canvas.drawRect(realRectCinta, paintCintaModal)
+            }
+
+            val racimoDetectado = if (conteoManosFoto > 0) 1 else 0
+
+            runOnUiThread {
+                // Se envía el bitmap ya modificado con los canvas aplicados
+                mostrarModalResultados(bitmapResultadoConCuadros, racimoDetectado, conteoManosFoto, colorCintaFoto)
+            }
+
+        } catch (e: Exception) {
+            Log.e("TensorFlow", "Error procesando imagen estática", e)
+        }
+    }
+
+    // Función auxiliar de soporte para el cálculo de intersección (IoU) si se requiere de forma local
+    private fun calculateIoU(box1: RectF, box2: RectF): Float {
+        val intersectionLeft = maxOf(box1.left, box2.left)
+        val intersectionTop = maxOf(box1.top, box2.top)
+        val intersectionRight = minOf(box1.right, box2.right)
+        val intersectionBottom = minOf(box1.bottom, box2.bottom)
+
+        if (intersectionLeft < intersectionRight && intersectionTop < intersectionBottom) {
+            val intersectionArea = (intersectionRight - intersectionLeft) * (intersectionBottom - intersectionTop)
+            val box1Area = (box1.right - box1.left) * (box1.bottom - box1.top)
+            val box2Area = (box2.right - box2.left) * (box2.bottom - box2.top)
+            return intersectionArea / (box1Area + box2Area - intersectionArea)
+        }
+        return 0f
+    }
+
+    // 2. NUEVA FUNCIÓN: Genera y despliega el Modal Emergente con el diseño y resultados
+    private fun mostrarModalResultados(bitmapResultado: Bitmap, racimos: Int, manos: Int, colorCinta: String) {
+        val builder = AlertDialog.Builder(this)
+
+        val layoutModal = android.widget.LinearLayout(this).apply {
+            orientation = android.widget.LinearLayout.VERTICAL
+            setPadding(40, 40, 40, 40)
+        }
+
+        val imageView = android.widget.ImageView(this).apply {
+            layoutParams = android.widget.LinearLayout.LayoutParams(
+                android.widget.LinearLayout.LayoutParams.MATCH_PARENT,
+                800
+            )
+            setImageBitmap(bitmapResultado)
+            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+        }
+
+        val tvInfo = TextView(this).apply {
+            text = """
+            Resultados del Análisis:
+            -------------------------------------------
+            • Racimos Identificados: $racimos
+            • Número de Manos Únicas: $manos
+            • Color de Cinta Encontrado: $colorCinta
+        """.trimIndent()
+
+            // CORRECCIÓN AQUÍ: Se asigna el tamaño como Float directamente y se especifica la unidad SP correctamente
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, 16f)
+
+            setTextColor(android.graphics.Color.BLACK)
+            setPadding(0, 30, 0, 10)
+        }
+
+        layoutModal.addView(imageView)
+        layoutModal.addView(tvInfo)
+
+        builder.setView(layoutModal)
+        builder.setTitle("Análisis de Imagen Completado")
+        builder.setPositiveButton("Aceptar") { dialog, _ -> dialog.dismiss() }
+
+        val dialog = builder.create()
+        dialog.show()
+    }
+
+    private fun ejecutarInferenciaYOLO(bitmap: Bitmap) {
+        val interpreter = tfLiteInterpreter ?: return
+        val resizedBitmap = Bitmap.createScaledBitmap(bitmap, 640, 640, true)
+        val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
+        val outputMap = Array(1) { Array(6) { FloatArray(8400) } }
+
+        try {
+            interpreter.run(inputBuffer, outputMap)
+
+            val candidatasManos = mutableListOf<Pair<RectF, Float>>()
+            var mejorCintaDetectada: RectF? = null
+            var maxConfianzaCinta = 0.50f
+            val confUmbralMano = 0.45f
+
+            for (i in 0 until 8400) {
+                val confCinta = outputMap[0][4][i]
+                val confMano = outputMap[0][5][i]
+
+                if (confMano > confUmbralMano && confMano > confCinta) {
+                    val cx = outputMap[0][0][i]
+                    val cy = outputMap[0][1][i]
+                    val w = outputMap[0][2][i]
+                    val h = outputMap[0][3][i]
+                    candidatasManos.add(Pair(RectF(cx - w/2, cy - h/2, cx + w/2, cy + h/2), confMano))
+                } else if (confCinta > maxConfianzaCinta && confCinta > confMano) {
+                    maxConfianzaCinta = confCinta
+                    val cx = outputMap[0][0][i]
+                    val cy = outputMap[0][1][i]
+                    val w = outputMap[0][2][i]
+                    val h = outputMap[0][3][i]
+                    mejorCintaDetectada = RectF(cx - w/2, cy - h/2, cx + w/2, cy + h/2)
+                }
+            }
+
+            val manosFiltradas = aplicarNMS(candidatasManos, iouThreshold = 0.40f)
+            val cajasManosCuadroActual = mutableListOf<RectF>()
+            val cajasParaDibujarOverlay = mutableListOf<BoxDibujo>()
+
+            val scaleX = viewFinder.width.toFloat() / 640f
+            val scaleY = viewFinder.height.toFloat() / 640f
+
+            for (rectMano in manosFiltradas) {
+                cajasManosCuadroActual.add(rectMano)
+                val screenRect = RectF(rectMano.left * scaleX, rectMano.top * scaleY, rectMano.right * scaleX, rectMano.bottom * scaleY)
+                cajasParaDibujarOverlay.add(BoxDibujo(screenRect, "Mano", true))
+            }
+
+            bananaTracker.updateTracks(cajasManosCuadroActual, 640f)
+
+            if (mejorCintaDetectada != null) {
+                ultimoColorDetectado = obtenerColorDeCinta(bitmap, mejorCintaDetectada)
+                val screenRectCinta = RectF(mejorCintaDetectada.left * scaleX, mejorCintaDetectada.top * scaleY, mejorCintaDetectada.right * scaleX, mejorCintaDetectada.bottom * scaleY)
+                cajasParaDibujarOverlay.add(BoxDibujo(screenRectCinta, "Cinta: $ultimoColorDetectado", false))
+            }
+
+            val racimoEnVista = if (bananaTracker.totalUniqueHandsCount > 0) 1 else 0
+
+            runOnUiThread {
+                // Notifica y refresca la pantalla transparente con las líneas al instante
+                overlayView.setResults(cajasParaDibujarOverlay)
+
+                tvTotalRacimos.text = "Total de Racimos Enfocados: $racimoEnVista"
+                tvTotalManos.text = "Número de Manos Contadas: ${bananaTracker.totalUniqueHandsCount}"
+                tvColorCinta.text = "Color de la Cinta: $ultimoColorDetectado"
+            }
+        } catch (e: Exception) {
+            Log.e("TensorFlow", "Error en inferencia", e)
+        }
+    }
+
+    private fun aplicarNMS(cajas: List<Pair<RectF, Float>>, iouThreshold: Float): List<RectF> {
+        val ordenadas = cajas.sortedByDescending { it.second }.toMutableList()
+        val resultado = mutableListOf<RectF>()
+        while (ordenadas.isNotEmpty()) {
+            val primera = ordenadas.removeAt(0)
+            resultado.add(primera.first)
+            val iterator = ordenadas.iterator()
+            while (iterator.hasNext()) {
+                val siguiente = iterator.next()
+                if (calcularIoUEnMainActivity(primera.first, siguiente.first) > iouThreshold) {
+                    iterator.remove()
+                }
+            }
+        }
+        return resultado
+    }
+
+    private fun calcularIoUEnMainActivity(box1: RectF, box2: RectF): Float {
+        val x1 = maxOf(box1.left, box2.left)
+        val y1 = maxOf(box1.top, box2.top)
+        val x2 = minOf(box1.right, box2.right)
+        val y2 = minOf(box1.bottom, box2.bottom)
+        if (x1 < x2 && y1 < y2) {
+            val intersection = (x2 - x1) * (y2 - y1)
+            val box1Area = (box1.right - box1.left) * (box1.bottom - box1.top)
+            val box2Area = (box2.right - box2.left) * (box2.bottom - box2.top)
+            return intersection / (box1Area + box2Area - intersection)
+        }
+        return 0f
     }
 
     private fun checkCameraPermission() {
         if (allPermissionsGranted()) {
             startCamera()
         } else {
-            if (ActivityCompat.shouldShowRequestPermissionRationale(this, Manifest.permission.CAMERA)) {
-                mostrarDialogoExplicativo()
-            } else {
-                ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-            }
+            ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
         }
     }
 
@@ -124,111 +495,19 @@ class MainActivity : AppCompatActivity() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
             val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
-
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(viewFinder.surfaceProvider)
-            }
-
-            val rotation = viewFinder.display?.rotation ?: android.view.Surface.ROTATION_0
-
+            val preview = Preview.Builder().build().also { it.setSurfaceProvider(viewFinder.surfaceProvider) }
             val imageAnalyzer = ImageAnalysis.Builder()
-                .setTargetRotation(rotation)
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888) // Forzamos RGBA para manipulación directa de píxeles
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
-                .also {
-                    it.setAnalyzer(cameraExecutor) { imageProxy ->
-                        procesarImagenConIA(imageProxy)
-                    }
-                }
-
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                .also { it.setAnalyzer(cameraExecutor) { img -> procesarImagenConIA(img) } }
             try {
                 cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
-            } catch (exc: Exception) {
-                Log.e("CameraX", "Fallo el inicio de la cámara", exc)
+                cameraProvider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageAnalyzer)
+            } catch (e: Exception) {
+                Log.e("CameraX", "Error de inicio", e)
             }
         }, ContextCompat.getMainExecutor(this))
-    }
-
-    @androidx.camera.core.ExperimentalGetImage
-    private fun procesarImagenConIA(imageProxy: ImageProxy) {
-        val interpreter = tfLiteInterpreter
-        if (interpreter != null) {
-            // Convertimos el ImageProxy a Bitmap nativo compatible
-            val bitmap = imageProxyToBitmap(imageProxy)
-
-            if (bitmap != null) {
-                // Redimensionamos al tamaño de entrada que espera el modelo (640x640)
-                val resizedBitmap = Bitmap.createScaledBitmap(bitmap, 640, 640, true)
-                val inputBuffer = convertBitmapToByteBuffer(resizedBitmap)
-
-                // CONTENEDOR CORRECTO PARA LA SALIDA DE YOLOV11 SIN NMS: [1][6][8400]
-                // Índices: 0,1,2,3 -> Cajas | 4 -> Confianza Clase 'cinta' | 5 -> Confianza Clase 'mano'
-                val outputMap = Array(1) { Array(6) { FloatArray(8400) } }
-
-                try {
-                    interpreter.run(inputBuffer, outputMap)
-
-                    // Lista temporal donde guardaremos las coordenadas de las manos vistas en ESTE cuadro físico
-                    val cajasManosCuadroActual = mutableListOf<RectF>()
-                    var mejorCintaDetectada: RectF? = null
-                    var maxConfianzaCinta = 0.50f // Umbral del 50% para la cinta
-                    val confUmbralMano = 0.50f    // Umbral del 50% para las manos
-
-                    // Recorremos las 8400 predicciones brutas de la arquitectura YOLOv11
-                    for (i in 0 until 8400) {
-                        val confCinta = outputMap[0][4][i]
-                        val confMano = outputMap[0][5][i]
-
-                        // Si la probabilidad más alta pertenece a una MANO
-                        if (confMano > confUmbralMano && confMano > confCinta) {
-                            val cx = outputMap[0][0][i] * bitmap.width / 640f
-                            val cy = outputMap[0][1][i] * bitmap.height / 640f
-                            val w = outputMap[0][2][i] * bitmap.width / 640f
-                            val h = outputMap[0][3][i] * bitmap.height / 640f
-
-                            val rect = RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
-                            cajasManosCuadroActual.add(rect)
-                        }
-                        // Si la probabilidad más alta pertenece a una CINTA
-                        else if (confCinta > maxConfianzaCinta && confCinta > confMano) {
-                            maxConfianzaCinta = confCinta
-                            val cx = outputMap[0][0][i] * bitmap.width / 640f
-                            val cy = outputMap[0][1][i] * bitmap.height / 640f
-                            val w = outputMap[0][2][i] * bitmap.width / 640f
-                            val h = outputMap[0][3][i] * bitmap.height / 640f
-
-                            mejorCintaDetectada = RectF(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2)
-                        }
-                    }
-
-                    // Enviamos las cajas de las manos detectadas en este cuadro al Tracker por IoU
-                    bananaTracker.updateTracks(cajasManosCuadroActual)
-
-                    // Si el modelo localizó una cinta válida, extraemos dinámicamente su color real en HSV
-                    if (mejorCintaDetectada != null) {
-                        ultimoColorDetectado = obtenerColorDeCinta(bitmap, mejorCintaDetectada)
-                    } else if (bananaTracker.totalUniqueHandsCount == 0) {
-                        ultimoColorDetectado = "Sin Cinta"
-                    }
-
-                    // Si hay IDs registrados en memoria, asumimos que hay mínimo un racimo enfocado
-                    val racimoEnVista = if (bananaTracker.totalUniqueHandsCount > 0) 1 else 0
-
-                    // Envío ordenado de resultados limpios al hilo principal de la interfaz
-                    runOnUiThread {
-                        tvTotalRacimos.text = "Total de Racimos Enfocados: $racimoEnVista"
-                        tvTotalManos.text = "Número de Manos Contadas: ${bananaTracker.totalUniqueHandsCount}"
-                        tvColorCinta.text = "Color de la Cinta: $ultimoColorDetectado"
-                    }
-                } catch (e: Exception) {
-                    Log.e("TensorFlow", "Error en la inferencia del modelo", e)
-                }
-            }
-        }
-        imageProxy.close()
     }
 
     private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
@@ -237,77 +516,44 @@ class MainActivity : AppCompatActivity() {
         val pixelStride = planes[0].pixelStride
         val rowStride = planes[0].rowStride
         val rowPadding = rowStride - pixelStride * imageProxy.width
-
-        val bitmap = Bitmap.createBitmap(
-            imageProxy.width + rowPadding / pixelStride,
-            imageProxy.height,
-            Bitmap.Config.ARGB_8888
-        )
+        val bitmap = Bitmap.createBitmap(imageProxy.width + rowPadding / pixelStride, imageProxy.height, Bitmap.Config.ARGB_8888)
         bitmap.copyPixelsFromBuffer(buffer)
-
-        // Corregimos la rotación física del sensor del teléfono para procesar derecho el racimo
         if (imageProxy.imageInfo.rotationDegrees != 0) {
-            val matrix = Matrix()
-            matrix.postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+            val matrix = Matrix().apply { postRotate(imageProxy.imageInfo.rotationDegrees.toFloat()) }
             return Bitmap.createBitmap(bitmap, 0, 0, imageProxy.width, imageProxy.height, matrix, true)
         }
         return bitmap
     }
 
     private fun obtenerColorDeCinta(bitmapOriginal: Bitmap, rectCinta: RectF): String {
-        // Asegurar que el cuadro recortado no se salga de los límites reales de la foto capturada
         val left = maxOf(0, rectCinta.left.toInt())
         val top = maxOf(0, rectCinta.top.toInt())
         val width = minOf(bitmapOriginal.width - left, rectCinta.width().toInt())
         val height = minOf(bitmapOriginal.height - top, rectCinta.height().toInt())
-
         if (width <= 0 || height <= 0) return "Detectando..."
-
-        // Recortamos la sub-imagen exacta donde la IA dice que está la cinta de edad
         val cropCinta = Bitmap.createBitmap(bitmapOriginal, left, top, width, height)
-
-        var sumHue = 0f
-        var sumSat = 0f
-        var sumVal = 0f
-        val totalPixeles = cropCinta.width * cropCinta.height
+        var sumHue = 0f; var sumSat = 0f; val totalPixeles = cropCinta.width * cropCinta.height
         val hsv = FloatArray(3)
-
-        // Recorremos los píxeles para promediar el color real tapando sombras del cobertizo
         for (x in 0 until cropCinta.width) {
             for (y in 0 until cropCinta.height) {
-                val pixel = cropCinta.getPixel(x, y)
-                android.graphics.Color.colorToHSV(pixel, hsv)
-                sumHue += hsv[0]
-                sumSat += hsv[1]
-                sumVal += hsv[2]
+                Color.colorToHSV(cropCinta.getPixel(x, y), hsv)
+                sumHue += hsv[0]; sumSat += hsv[1]
             }
         }
-
         val avgHue = sumHue / totalPixeles
-        val avgSat = sumSat / totalPixeles
-        val avgVal = sumVal / totalPixeles
-
-        // Si está muy oscuro o muy opaco debido al entorno, se marca como sombra
-        if (avgVal < 0.2f || avgSat < 0.15f) return "Buscando... (Sombra)"
-
-        // Clasificación matemática según los grados del espectro HUE (0° a 360°)
         return when (avgHue) {
-            in 0.0..20.0 -> "Rojo (Semana 1)"
-            in 20.0..50.0 -> "Naranja (Semana 2)"
-            in 50.0..85.0 -> "Amarillo / Verde Claro (Semana 3)"
-            in 85.0..160.0 -> "Verde (Semana 4)"
-            in 160.0..240.0 -> "Azul / Morado (Semana 5)"
-            in 240.0..330.0 -> "Morado / Violeta (Semana 6)"
-            else -> "Sin Cinta"
+            in 0.0..20.0 -> "Rojo"
+            in 20.0..50.0 -> "Naranja"
+            in 50.0..85.0 -> "Amarillo"
+            in 85.0..160.0 -> "Verde"
+            else -> "Azul"
         }
     }
 
     private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
-        val byteBuffer = ByteBuffer.allocateDirect(1 * 640 * 640 * 3 * 4)
-        byteBuffer.order(ByteOrder.nativeOrder())
+        val byteBuffer = ByteBuffer.allocateDirect(1 * 640 * 640 * 3 * 4).apply { order(ByteOrder.nativeOrder()) }
         val intValues = IntArray(640 * 640)
         bitmap.getPixels(intValues, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-
         var pixel = 0
         for (i in 0 until 640) {
             for (j in 0 until 640) {
@@ -320,57 +566,8 @@ class MainActivity : AppCompatActivity() {
         return byteBuffer
     }
 
-    private fun mostrarDialogoExplicativo() {
-        AlertDialog.Builder(this)
-            .setTitle("Permiso de Cámara Requerido")
-            .setMessage("Esta aplicación necesita acceder a la cámara para escanear las manos de banano en tiempo real.")
-            .setPositiveButton("Conceder Permiso") { _, _ ->
-                ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-            }
-            .setNegativeButton("Salir") { _, _ -> finish() }
-            .setCancelable(false)
-            .show()
-    }
-
-    private fun mostrarDialogoAjustesSistema() {
-        AlertDialog.Builder(this)
-            .setTitle("Permiso denegado")
-            .setMessage("Por favor ve a los ajustes de la aplicación y activa el permiso de Cámara manualmente.")
-            .setPositiveButton("Ir a Ajustes") { _, _ ->
-                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
-                    data = Uri.fromParts("package", packageName, null)
-                }
-                startActivity(intent)
-            }
-            .setNegativeButton("Cancelar") { _, _ -> finish() }
-            .setCancelable(false)
-            .show()
-    }
-
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
-    }
-
-    override fun onRequestPermissionsResult(rc: Int, perms: Array<String>, results: IntArray) {
-        super.onRequestPermissionsResult(rc, perms, results)
-        if (rc == REQUEST_CODE_PERMISSIONS) {
-            if (allPermissionsGranted()) {
-                startCamera()
-            } else {
-                if (!ActivityCompat.shouldShowRequestPermissionRationale(this, Manifest.permission.CAMERA)) {
-                    mostrarDialogoAjustesSistema()
-                } else {
-                    finish()
-                }
-            }
-        }
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        tfLiteInterpreter?.close()
-        cameraExecutor.shutdown()
-    }
+    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
+    override fun onDestroy() { super.onDestroy(); tfLiteInterpreter?.close(); cameraExecutor.shutdown() }
 
     companion object {
         private const val REQUEST_CODE_PERMISSIONS = 10

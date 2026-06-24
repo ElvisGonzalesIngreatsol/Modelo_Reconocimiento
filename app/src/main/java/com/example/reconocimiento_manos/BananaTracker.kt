@@ -5,7 +5,7 @@ import android.graphics.RectF
 data class TrackedHand(
     val id: Int,
     var boundingBox: RectF,
-    var missedFrames: Int = 0 // Contador de fotogramas que ha estado desaparecida
+    var missedFrames: Int = 0 // Cuántos fotogramas lleva sin detectarse
 )
 
 class BananaTracker {
@@ -17,15 +17,15 @@ class BananaTracker {
 
     private val countedIds = mutableSetOf<Int>()
 
-    // CONFIGURACIÓN DE AJUSTE (HIERPARÁMETROS DEL TRACKER)
-    private val IOU_THRESHOLD = 0.60f    // Sube al 60% para evitar que el parpadeo genere IDs falsos
-    private val MAX_MISSED_FRAMES = 15   // Si la mano parpadea o se tapa, la recordamos por 15 frames antes de borrarla
+    // PARÁMETROS AJUSTADOS PARA EVITAR CONTAR MANOS REPETIDAS
+    private val IOU_THRESHOLD = 0.15f     // Más bajo para que asocie la mano aunque se mueva rápido
+    private val MAX_MISSED_FRAMES = 35    // Memoria alta (35 frames): si el modelo parpadea, mantiene el ID viejo
 
-    fun updateTracks(detectedBoxes: List<RectF>) {
+    fun updateTracks(detectedBoxes: List<RectF>, frameWidth: Float) {
         val updatedTracks = mutableListOf<TrackedHand>()
         val usedBoxes = BooleanArray(detectedBoxes.size)
 
-        // 1. Intentar emparejar las detecciones nuevas con los IDs existentes en memoria
+        // 1. Intentar emparejar las manos en movimiento con la memoria existente
         for (track in activeTracks) {
             var bestBoxIdx = -1
             var bestIoU = IOU_THRESHOLD
@@ -40,29 +40,27 @@ class BananaTracker {
             }
 
             if (bestBoxIdx != -1) {
-                // La mano sigue en pantalla: actualizamos coordenadas y reiniciamos su contador de fallos
+                // La mano sigue siendo la misma: actualizamos su posición y reiniciamos el contador de olvido
                 track.boundingBox = detectedBoxes[bestBoxIdx]
                 track.missedFrames = 0
                 usedBoxes[bestBoxIdx] = true
                 updatedTracks.add(track)
             } else {
-                // La mano no se detectó en este fotograma. Le sumamos un fallo.
+                // No se detectó en este cuadro, le sumamos un cuadro de olvido
                 track.missedFrames++
-                // Si aún no supera el límite de tolerancia, la retenemos para que no pierda su ID
                 if (track.missedFrames <= MAX_MISSED_FRAMES) {
-                    updatedTracks.add(track)
+                    updatedTracks.add(track) // La mantenemos viva en memoria
                 }
             }
         }
 
-        // 2. Registrar manos completamente nuevas que acaban de entrar a la toma
+        // 2. Registrar manos completamente nuevas (solo si no se emparejaron con nada previo)
         for (i in detectedBoxes.indices) {
             if (!usedBoxes[i]) {
                 val newBox = detectedBoxes[i]
 
-                // TRUCO DE CONTROL: Para evitar que el ruido de los bordes sume infinitamente,
-                // solo registramos la mano si está dentro de la zona central de la pantalla (Margen del 5%)
-                if (newBox.left > 5f && newBox.right < 635f) {
+                // Evitamos registrar ruidos falsos en los bordes extremos de la pantalla
+                if (newBox.left > 5f && newBox.right < (frameWidth - 5f)) {
                     val newTrack = TrackedHand(id = nextId++, boundingBox = newBox)
                     updatedTracks.add(newTrack)
 
@@ -78,6 +76,13 @@ class BananaTracker {
         activeTracks.addAll(updatedTracks)
     }
 
+    fun reset() {
+        nextId = 1
+        activeTracks.clear()
+        countedIds.clear()
+        totalUniqueHandsCount = 0
+    }
+
     private fun calculateIoU(box1: RectF, box2: RectF): Float {
         val intersectionLeft = maxOf(box1.left, box2.left)
         val intersectionTop = maxOf(box1.top, box2.top)
@@ -91,12 +96,5 @@ class BananaTracker {
             return intersectionArea / (box1Area + box2Area - intersectionArea)
         }
         return 0f
-    }
-
-    fun resetTracker() {
-        nextId = 1
-        activeTracks.clear()
-        countedIds.clear()
-        totalUniqueHandsCount = 0
     }
 }

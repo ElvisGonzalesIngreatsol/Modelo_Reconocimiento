@@ -4,7 +4,7 @@ plugins {
 
 android {
     namespace = "com.example.reconocimiento_manos"
-    compileSdk = 36
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.example.reconocimiento_manos"
